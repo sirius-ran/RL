@@ -119,6 +119,13 @@ USE_VAL_SELECTION = env_bool("USE_VAL_SELECTION", False)
 VAL_EVERY_EPISODES = env_int("VAL_EVERY_EPISODES", 10)
 VAL_MAX_STEPS = env_int("VAL_MAX_STEPS", 500)
 VAL_NUM_STARTS = env_int("VAL_NUM_STARTS", 3)
+VAL_SELECTION_OBJECTIVE = os.environ.get("VAL_SELECTION_OBJECTIVE", "mae").strip().lower()
+VAL_ACTION_DEADZONE = env_float("VAL_ACTION_DEADZONE", 0.5)
+VAL_SAT_LOW = env_float("VAL_SAT_LOW", 5.0)
+VAL_SAT_HIGH = env_float("VAL_SAT_HIGH", 95.0)
+VAL_SCORE_DELTA_WEIGHT = env_float("VAL_SCORE_DELTA_WEIGHT", 0.01)
+VAL_SCORE_SAT_WEIGHT = env_float("VAL_SCORE_SAT_WEIGHT", 0.01)
+VAL_SCORE_FLIP_WEIGHT = env_float("VAL_SCORE_FLIP_WEIGHT", 0.005)
 MAX_EPISODES = env_int("MAX_EPISODES", 200)
 WARMUP_STEPS = env_int("WARMUP_STEPS", 5000)
 
@@ -134,6 +141,10 @@ if BC_DEMO_FILTER_MODE not in {"all", "filtered", "soft"}:
     raise ValueError(
         f"Unsupported BC_DEMO_FILTER_MODE={BC_DEMO_FILTER_MODE!r}; "
         "use 'all', 'filtered', or 'soft'.")
+if VAL_SELECTION_OBJECTIVE not in {"mae", "quality_score"}:
+    raise ValueError(
+        f"Unsupported VAL_SELECTION_OBJECTIVE={VAL_SELECTION_OBJECTIVE!r}; "
+        "use 'mae' or 'quality_score'.")
 
 # ══════════════════════════════════════════
 # 加载模型
@@ -1097,10 +1108,48 @@ def validation_start_indices(eval_env, num_starts):
     return [int(x) for x in np.linspace(eval_env.n_lags, max_start, num_starts)]
 
 
+def validation_action_metrics(us):
+    values = np.array(us, dtype=np.float32)
+    if len(values) <= 1:
+        du = np.array([], dtype=np.float32)
+    else:
+        du = np.diff(values)
+    abs_du = np.abs(du)
+
+    move_mask = abs_du >= VAL_ACTION_DEADZONE
+    move_sign = np.sign(du[move_mask])
+    if len(move_sign) <= 1:
+        flip_rate = 0.0
+    else:
+        flip_rate = float(np.mean(move_sign[1:] * move_sign[:-1] < 0) * 100.0)
+
+    return {
+        'u_mean': float(np.mean(values)) if len(values) else 0.0,
+        'u_min': float(np.min(values)) if len(values) else 0.0,
+        'u_max': float(np.max(values)) if len(values) else 0.0,
+        'mean_abs_delta_u': float(np.mean(abs_du)) if len(abs_du) else 0.0,
+        'p95_abs_delta_u': float(np.percentile(abs_du, 95)) if len(abs_du) else 0.0,
+        'direction_flip_rate_pct': flip_rate,
+        'saturation_rate_pct': float(np.mean((values <= VAL_SAT_LOW) | (values >= VAL_SAT_HIGH)) * 100.0) if len(values) else 0.0,
+    }
+
+
+def validation_selection_score(stats):
+    if VAL_SELECTION_OBJECTIVE == "mae":
+        return stats['mae']
+    return (
+        stats['mae'] +
+        VAL_SCORE_DELTA_WEIGHT * stats['p95_abs_delta_u'] +
+        VAL_SCORE_SAT_WEIGHT * stats['saturation_rate_pct'] +
+        VAL_SCORE_FLIP_WEIGHT * stats['direction_flip_rate_pct']
+    )
+
+
 def evaluate_actor_on_env(actor, eval_env, eval_shadow_aug, num_starts=3):
     was_training = actor.training
     actor.eval()
     diffs = []
+    us = []
     with torch.no_grad():
         for start_idx in validation_start_indices(eval_env, num_starts):
             s_raw = eval_env.reset_at(start_idx)
@@ -1111,6 +1160,7 @@ def evaluate_actor_on_env(actor, eval_env, eval_shadow_aug, num_starts=3):
                 planned_u = decode_action(eval_env.curr_u, a_raw, state=s)
                 ns_raw, _, done, info = eval_env.step(planned_u[0])
                 diffs.append(float(info['diff']))
+                us.append(float(info['u_rl']))
                 s = augment_state(ns_raw, eval_env, eval_shadow_aug)
                 if done:
                     break
@@ -1118,14 +1168,16 @@ def evaluate_actor_on_env(actor, eval_env, eval_shadow_aug, num_starts=3):
         actor.train()
     diffs = np.array(diffs, dtype=np.float32)
     abs_diffs = np.abs(diffs)
-    return {
+    stats = {
         'mae': float(np.mean(abs_diffs)),
         'rmse': float(np.sqrt(np.mean(diffs ** 2))),
         'in2': float(np.mean(abs_diffs <= 2.0) * 100.0),
         'in5': float(np.mean(abs_diffs <= 5.0) * 100.0),
         'n': int(len(diffs)),
     }
-
+    stats.update(validation_action_metrics(us))
+    stats['selection_score'] = float(validation_selection_score(stats))
+    return stats
 
 if __name__ == "__main__":
     # ── 随机种子：两组消融实验设同一种子，消除起始点/初始化/采样的随机差异 ──
@@ -1267,7 +1319,11 @@ if __name__ == "__main__":
     TRAIN_REWARD_PKL_OUT = ROOT / "results/checkpoints" / f"multistep_best_{TAG}_trainReward.pkl"
     VAL_HISTORY_OUT = ROOT / "results/evaluation" / f"validation_history_{TAG}.csv"
     if use_val_selection:
-        print(f"[Validation] actor selected by validation MAE -> {ACTOR_OUT}")
+        print(f"[Validation] actor selected by {VAL_SELECTION_OBJECTIVE} -> {ACTOR_OUT}")
+        if VAL_SELECTION_OBJECTIVE == "quality_score":
+            print(f"[Validation] score = MAE + {VAL_SCORE_DELTA_WEIGHT:.4f}*p95|du| + "
+                  f"{VAL_SCORE_SAT_WEIGHT:.4f}*sat% + "
+                  f"{VAL_SCORE_FLIP_WEIGHT:.4f}*flip%")
         print(f"[Validation] train-reward actor backup -> {TRAIN_REWARD_ACTOR_OUT}")
     print(f"产物标签 TAG = {TAG}  (actor→{ACTOR_OUT})")
     print()
@@ -1293,7 +1349,7 @@ if __name__ == "__main__":
     print(f"预热完成，共 {len(agent.replay)} 条经验\n")
 
     best_reward, best_history = -float('inf'), None
-    best_val_mae = float('inf')
+    best_val_score = float('inf')
     val_history = []
     no_improve_count = 0
     frozen           = False
@@ -1386,20 +1442,33 @@ if __name__ == "__main__":
                 'val_in2': val_stats['in2'],
                 'val_in5': val_stats['in5'],
                 'val_n': val_stats['n'],
+                'val_u_mean': val_stats['u_mean'],
+                'val_u_min': val_stats['u_min'],
+                'val_u_max': val_stats['u_max'],
+                'val_mean_abs_delta_u': val_stats['mean_abs_delta_u'],
+                'val_p95_abs_delta_u': val_stats['p95_abs_delta_u'],
+                'val_saturation_rate_pct': val_stats['saturation_rate_pct'],
+                'val_direction_flip_rate_pct': val_stats['direction_flip_rate_pct'],
+                'val_selection_score': val_stats['selection_score'],
+                'val_selection_objective': VAL_SELECTION_OBJECTIVE,
             }
             val_history.append(val_row)
             print(f"  [Validation] MAE={val_stats['mae']:.3f} | "
                   f"RMSE={val_stats['rmse']:.3f} | "
-                  f"±2={val_stats['in2']:.2f}% | ±5={val_stats['in5']:.2f}%")
-            if val_stats['mae'] < best_val_mae:
-                best_val_mae = val_stats['mae']
+                  f"+/-2={val_stats['in2']:.2f}% | +/-5={val_stats['in5']:.2f}% | "
+                  f"p95|du|={val_stats['p95_abs_delta_u']:.2f} | "
+                  f"sat={val_stats['saturation_rate_pct']:.2f}% | "
+                  f"flip={val_stats['direction_flip_rate_pct']:.2f}% | "
+                  f"score={val_stats['selection_score']:.3f}")
+            if val_stats['selection_score'] < best_val_score:
+                best_val_score = val_stats['selection_score']
                 best_history = ep_data
                 (ROOT / "models/actors").mkdir(parents=True, exist_ok=True)
                 (ROOT / "results/checkpoints").mkdir(parents=True, exist_ok=True)
                 torch.save(agent.actor.state_dict(), ACTOR_OUT)
                 joblib.dump(ep_data, PKL_OUT)
-                print(f"  [Validation best] saved actor (Val MAE={best_val_mae:.3f})")
-
+                print(f"  [Validation best] saved actor "
+                      f"(score={best_val_score:.3f}, Val MAE={val_stats['mae']:.3f})")
     if val_history:
         VAL_HISTORY_OUT.parent.mkdir(parents=True, exist_ok=True)
         pd.DataFrame(val_history).to_csv(VAL_HISTORY_OUT, index=False, encoding='utf-8-sig')
