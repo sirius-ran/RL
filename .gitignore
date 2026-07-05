@@ -1,0 +1,30 @@
+# Local data and generated artifacts
+data/
+models/
+results/
+figure/
+
+# IDE/project-local files
+.idea/
+.vscode/
+
+# Python cache and environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+env/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Accidental third-party cache written into the workspace
+%SystemDrive%/
