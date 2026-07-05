@@ -86,6 +86,13 @@ BC_FILTER_IMPROVE_TOL = env_float("BC_FILTER_IMPROVE_TOL", 0.0)
 BC_FILTER_IMPROVE_MIN_ERROR = env_float("BC_FILTER_IMPROVE_MIN_ERROR", 2.0)
 BC_FILTER_CHECK_DIRECTION = env_bool("BC_FILTER_CHECK_DIRECTION", True)
 BC_FILTER_DEADZONE_U = env_float("BC_FILTER_DEADZONE_U", DEADZONE_FRAC * 100.0)
+BC_SOFT_WEIGHT_MIN = env_float("BC_SOFT_WEIGHT_MIN", 0.2)
+BC_SOFT_WEIGHT_SATURATION = env_float("BC_SOFT_WEIGHT_SATURATION", 0.7)
+BC_SOFT_WEIGHT_ACTION_JUMP = env_float("BC_SOFT_WEIGHT_ACTION_JUMP", 0.6)
+BC_SOFT_WEIGHT_LOAD_JUMP = env_float("BC_SOFT_WEIGHT_LOAD_JUMP", 0.8)
+BC_SOFT_WEIGHT_WRONG_DIRECTION = env_float("BC_SOFT_WEIGHT_WRONG_DIRECTION", 0.35)
+BC_SOFT_WEIGHT_NO_IMPROVEMENT = env_float("BC_SOFT_WEIGHT_NO_IMPROVEMENT", 0.7)
+BC_SOFT_SNAP_DEADZONE = env_bool("BC_SOFT_SNAP_DEADZONE", False)
 BC_REG_MODE = os.environ.get("BC_REG_MODE", "action").strip().lower()
 BC_DELTA_SCALE = env_float("BC_DELTA_SCALE", 10.0)
 BC_DELTA_DEADZONE = env_float("BC_DELTA_DEADZONE", DEADZONE_FRAC * 100.0)
@@ -117,10 +124,10 @@ if PRIOR_OUTPUT_MODE not in {"absolute", "delta"}:
     raise ValueError(
         f"Unsupported PRIOR_OUTPUT_MODE={PRIOR_OUTPUT_MODE!r}; "
         "use 'absolute' or 'delta'.")
-if BC_DEMO_FILTER_MODE not in {"all", "filtered"}:
+if BC_DEMO_FILTER_MODE not in {"all", "filtered", "soft"}:
     raise ValueError(
         f"Unsupported BC_DEMO_FILTER_MODE={BC_DEMO_FILTER_MODE!r}; "
-        "use 'all' or 'filtered'.")
+        "use 'all', 'filtered', or 'soft'.")
 
 # ══════════════════════════════════════════
 # 加载模型
@@ -411,16 +418,17 @@ class DemoBuffer:
     def __init__(self, capacity=200_000):
         self.buffer = deque(maxlen=capacity)
 
-    def push(self, s, a, curr_a):
-        self.buffer.append((s, a, curr_a))
+    def push(self, s, a, curr_a, weight=1.0):
+        self.buffer.append((s, a, curr_a, float(weight)))
 
     def sample(self, batch_size):
         batch_size = min(batch_size, len(self.buffer))
         batch = random.sample(self.buffer, batch_size)
-        s, a, curr_a = zip(*batch)
+        s, a, curr_a, weight = zip(*batch)
         return (np.array(s, dtype=np.float32),
                 np.array(a, dtype=np.float32),
-                np.array(curr_a, dtype=np.float32))
+                np.array(curr_a, dtype=np.float32),
+                np.array(weight, dtype=np.float32).reshape(-1, 1))
 
     def __len__(self):
         return len(self.buffer)
@@ -739,26 +747,27 @@ def build_demo_state(env, shadow_aug, t: int, target_sp=606.0):
     return np.concatenate([base, shadow]).astype(np.float32)
 
 
-def bc_filter_reason(env, t: int, target_sp=606.0):
+def bc_filter_reasons(env, t: int, target_sp=606.0):
     if BC_DEMO_FILTER_MODE == "all":
-        return None
+        return []
 
+    reasons = []
     curr_u = float(env.df[COL_U].iloc[t])
     next_u = float(env.df[COL_U].iloc[t + 1])
     delta_u = next_u - curr_u
 
     if (curr_u < BC_FILTER_U_MIN or curr_u > BC_FILTER_U_MAX or
             next_u < BC_FILTER_U_MIN or next_u > BC_FILTER_U_MAX):
-        return "saturation"
+        reasons.append("saturation")
     if abs(delta_u) > BC_FILTER_MAX_DELTA_U:
-        return "action_jump"
+        reasons.append("action_jump")
 
     curr_load = float(env.df[COL_LOAD].iloc[t])
     next_load = float(env.df[COL_LOAD].iloc[t + 1])
     load_step = max(abs(next_load - curr_load),
                     abs(float(env.df['load_delta'].iloc[t + 1])))
     if load_step > BC_FILTER_MAX_LOAD_DELTA:
-        return "load_jump"
+        reasons.append("load_jump")
 
     signed_error = float(target_sp - env.df[COL_Y].iloc[t])
     curr_error = abs(signed_error)
@@ -766,16 +775,37 @@ def bc_filter_reason(env, t: int, target_sp=606.0):
             abs(delta_u) >= BC_FILTER_DEADZONE_U):
         expected_sign = np.sign(signed_error) * np.sign(K)
         if expected_sign != 0 and np.sign(delta_u) != expected_sign:
-            return "wrong_direction"
+            reasons.append("wrong_direction")
 
     h = max(0, BC_FILTER_IMPROVE_HORIZON)
     if h > 0 and curr_error >= BC_FILTER_IMPROVE_MIN_ERROR and t + h < len(env.df):
         future_y = env.df[COL_Y].iloc[t + 1:t + h + 1].values
         best_future_error = float(np.min(np.abs(future_y - target_sp)))
         if best_future_error > curr_error - BC_FILTER_IMPROVE_TOL:
-            return "no_improvement"
+            reasons.append("no_improvement")
 
-    return None
+    return reasons
+
+
+def bc_filter_reason(env, t: int, target_sp=606.0):
+    reasons = bc_filter_reasons(env, t, target_sp=target_sp)
+    return reasons[0] if reasons else None
+
+
+def bc_demo_weight(reasons):
+    if BC_DEMO_FILTER_MODE != "soft" or not reasons:
+        return 1.0
+    penalties = {
+        "saturation": BC_SOFT_WEIGHT_SATURATION,
+        "action_jump": BC_SOFT_WEIGHT_ACTION_JUMP,
+        "load_jump": BC_SOFT_WEIGHT_LOAD_JUMP,
+        "wrong_direction": BC_SOFT_WEIGHT_WRONG_DIRECTION,
+        "no_improvement": BC_SOFT_WEIGHT_NO_IMPROVEMENT,
+    }
+    weight = 1.0
+    for reason in set(reasons):
+        weight *= penalties.get(reason, 1.0)
+    return float(max(BC_SOFT_WEIGHT_MIN, min(1.0, weight)))
 
 
 def build_demo_buffer(env, shadow_aug, target_sp=606.0):
@@ -799,40 +829,50 @@ def build_demo_buffer(env, shadow_aug, target_sp=606.0):
             skipped_quality += 1
             continue
 
-        reason = bc_filter_reason(env, t, target_sp=target_sp)
-        if reason is not None:
+        reasons = bc_filter_reasons(env, t, target_sp=target_sp)
+        for reason in reasons:
             skipped_filter[reason] += 1
+        if BC_DEMO_FILTER_MODE == "filtered" and reasons:
             continue
+        demo_weight = bc_demo_weight(reasons)
 
         s = build_demo_state(env, shadow_aug, t, target_sp=target_sp)
         a = []
         prev_u = float(env.df[COL_U].iloc[t])
         for k in range(CTRL_HORIZON):
             target_u = float(env.df[COL_U].iloc[t + k + 1])
-            if (BC_DEMO_FILTER_MODE == "filtered" and
-                    abs(target_u - prev_u) < BC_FILTER_DEADZONE_U):
-                target_u = prev_u
-                deadzone_snapped += 1
+            if (BC_DEMO_FILTER_MODE == "filtered" or
+                    (BC_DEMO_FILTER_MODE == "soft" and BC_SOFT_SNAP_DEADZONE)):
+                if abs(target_u - prev_u) < BC_FILTER_DEADZONE_U:
+                    target_u = prev_u
+                    deadzone_snapped += 1
             a.append(encode_actor_action(prev_u, target_u, state=s))
             prev_u = action_to_opening(prev_u, a[-1], state=s)
         curr_a = current_actor_reference(float(env.df[COL_U].iloc[t]), state=s)
         demo.push(s, np.array(a, dtype=np.float32),
-                  np.array([curr_a], dtype=np.float32))
+                  np.array([curr_a], dtype=np.float32),
+                  weight=demo_weight)
 
     total = max(t_end - t_start, 1)
     skipped_filtered_total = sum(skipped_filter.values())
+    weights = [x[3] for x in demo.buffer]
+    mean_weight = float(np.mean(weights)) if weights else 0.0
     print(f"[BC regularization] demo mode: {BC_DEMO_FILTER_MODE}")
     print(f"[BC regularization] demo samples: {len(demo):,}, "
           f"quality skipped: {skipped_quality:,} ({skipped_quality / total * 100:.1f}%), "
-          f"filtered skipped: {skipped_filtered_total:,} ({skipped_filtered_total / total * 100:.1f}%)")
-    if BC_DEMO_FILTER_MODE == "filtered":
+          f"flagged: {skipped_filtered_total:,} ({skipped_filtered_total / total * 100:.1f}%), "
+          f"mean_weight: {mean_weight:.3f}")
+    if BC_DEMO_FILTER_MODE in {"filtered", "soft"}:
         detail = ", ".join(f"{k}={v:,}" for k, v in skipped_filter.items())
-        print(f"[BC filtered] {detail}; deadzone snapped={deadzone_snapped:,}")
-        print(f"[BC filtered] u=[{BC_FILTER_U_MIN:.1f}, {BC_FILTER_U_MAX:.1f}], "
+        print(f"[BC {BC_DEMO_FILTER_MODE}] {detail}; deadzone snapped={deadzone_snapped:,}")
+        print(f"[BC {BC_DEMO_FILTER_MODE}] u=[{BC_FILTER_U_MIN:.1f}, {BC_FILTER_U_MAX:.1f}], "
               f"max_delta_u={BC_FILTER_MAX_DELTA_U:.1f}, "
               f"max_load_delta={BC_FILTER_MAX_LOAD_DELTA:.1f}, "
               f"improve_h={BC_FILTER_IMPROVE_HORIZON}, "
               f"min_error={BC_FILTER_IMPROVE_MIN_ERROR:.1f}")
+        if BC_DEMO_FILTER_MODE == "soft":
+            print(f"[BC soft] min_weight={BC_SOFT_WEIGHT_MIN:.2f}, "
+                  f"snap_deadzone={BC_SOFT_SNAP_DEADZONE}")
     return demo
 
 
@@ -862,6 +902,19 @@ class Critic(nn.Module):
 
     def forward(self, s, a):
         return self.net(torch.cat([s, a], dim=1))
+
+
+def weighted_tensor_mean(values, weights=None):
+    values = values.reshape(-1)
+    if weights is None:
+        return values.mean()
+    weights = weights.reshape(-1).to(values.device)
+    return (values * weights).sum() / weights.sum().clamp_min(1e-6)
+
+
+def weighted_action_mse(pred, target, weights=None):
+    losses = F.mse_loss(pred, target, reduction="none").mean(dim=1)
+    return weighted_tensor_mean(losses, weights)
 
 
 class DDPGAgent:
@@ -908,10 +961,11 @@ class DDPGAgent:
         bc_loss = torch.zeros((), device=device)
         bc_active_frac = 0.0
         if demo_buffer is not None and bc_lambda > 0.0 and len(demo_buffer) > 0:
-            ds, da, curr_a = demo_buffer.sample(demo_batch_size)
+            ds, da, curr_a, demo_w = demo_buffer.sample(demo_batch_size)
             DS = torch.FloatTensor(ds).to(device)
             DA = torch.FloatTensor(da).to(device)
             CA = torch.FloatTensor(curr_a).to(device)
+            DW = torch.FloatTensor(demo_w).to(device)
             pred_demo_actions = self.actor(DS)
             if BC_REG_Q_FILTER:
                 with torch.no_grad():
@@ -921,57 +975,72 @@ class DDPGAgent:
                 bc_active_frac = float(mask.float().mean().item())
                 if mask.any():
                     if BC_REG_MODE == "delta":
+                        DWA = DW[mask]
                         pred_delta = (pred_demo_actions[mask] - CA[mask]) * 50.0
                         demo_delta = (DA[mask] - CA[mask]) * 50.0
                         move_mask = torch.abs(demo_delta) >= BC_DELTA_DEADZONE
                         if move_mask.any():
-                            mag_loss = F.smooth_l1_loss(
+                            move_weights = DWA.expand_as(demo_delta)[move_mask]
+                            mag_vals = F.smooth_l1_loss(
                                 pred_delta[move_mask] / BC_DELTA_SCALE,
-                                demo_delta[move_mask] / BC_DELTA_SCALE)
-                            dir_loss = F.softplus(
+                                demo_delta[move_mask] / BC_DELTA_SCALE,
+                                reduction="none")
+                            mag_loss = weighted_tensor_mean(mag_vals, move_weights)
+                            dir_vals = F.softplus(
                                 -torch.sign(demo_delta[move_mask]) *
-                                pred_delta[move_mask] / BC_DELTA_SCALE).mean()
+                                pred_delta[move_mask] / BC_DELTA_SCALE)
+                            dir_loss = weighted_tensor_mean(dir_vals, move_weights)
                         else:
                             mag_loss = torch.zeros((), device=device)
                             dir_loss = torch.zeros((), device=device)
                         if (~move_mask).any():
-                            stay_loss = F.smooth_l1_loss(
+                            stay_weights = DWA.expand_as(demo_delta)[~move_mask]
+                            stay_vals = F.smooth_l1_loss(
                                 pred_delta[~move_mask] / BC_DELTA_SCALE,
-                                torch.zeros_like(pred_delta[~move_mask]))
+                                torch.zeros_like(pred_delta[~move_mask]),
+                                reduction="none")
+                            stay_loss = weighted_tensor_mean(stay_vals, stay_weights)
                         else:
                             stay_loss = torch.zeros((), device=device)
                         bc_loss = (BC_DELTA_MAG_WEIGHT * mag_loss +
                                    BC_DELTA_DIR_WEIGHT * dir_loss +
                                    BC_DELTA_STAY_WEIGHT * stay_loss)
                     else:
-                        bc_loss = nn.MSELoss()(pred_demo_actions[mask], DA[mask])
+                        bc_loss = weighted_action_mse(pred_demo_actions[mask], DA[mask], DW[mask])
             else:
-                bc_active_frac = 1.0
+                bc_active_frac = float(DW.mean().item())
                 if BC_REG_MODE == "delta":
                     pred_delta = (pred_demo_actions - CA) * 50.0
                     demo_delta = (DA - CA) * 50.0
                     move_mask = torch.abs(demo_delta) >= BC_DELTA_DEADZONE
                     if move_mask.any():
-                        mag_loss = F.smooth_l1_loss(
+                        move_weights = DW.expand_as(demo_delta)[move_mask]
+                        mag_vals = F.smooth_l1_loss(
                             pred_delta[move_mask] / BC_DELTA_SCALE,
-                            demo_delta[move_mask] / BC_DELTA_SCALE)
-                        dir_loss = F.softplus(
+                            demo_delta[move_mask] / BC_DELTA_SCALE,
+                            reduction="none")
+                        mag_loss = weighted_tensor_mean(mag_vals, move_weights)
+                        dir_vals = F.softplus(
                             -torch.sign(demo_delta[move_mask]) *
-                            pred_delta[move_mask] / BC_DELTA_SCALE).mean()
+                            pred_delta[move_mask] / BC_DELTA_SCALE)
+                        dir_loss = weighted_tensor_mean(dir_vals, move_weights)
                     else:
                         mag_loss = torch.zeros((), device=device)
                         dir_loss = torch.zeros((), device=device)
                     if (~move_mask).any():
-                        stay_loss = F.smooth_l1_loss(
+                        stay_weights = DW.expand_as(demo_delta)[~move_mask]
+                        stay_vals = F.smooth_l1_loss(
                             pred_delta[~move_mask] / BC_DELTA_SCALE,
-                            torch.zeros_like(pred_delta[~move_mask]))
+                            torch.zeros_like(pred_delta[~move_mask]),
+                            reduction="none")
+                        stay_loss = weighted_tensor_mean(stay_vals, stay_weights)
                     else:
                         stay_loss = torch.zeros((), device=device)
                     bc_loss = (BC_DELTA_MAG_WEIGHT * mag_loss +
                                BC_DELTA_DIR_WEIGHT * dir_loss +
                                BC_DELTA_STAY_WEIGHT * stay_loss)
                 else:
-                    bc_loss = nn.MSELoss()(pred_demo_actions, DA)
+                    bc_loss = weighted_action_mse(pred_demo_actions, DA, DW)
         a_loss = q_loss + float(bc_lambda) * bc_loss
         self.actor_opt.zero_grad(); a_loss.backward(); self.actor_opt.step()
         for p, tp in zip(self.actor.parameters(),  self.actor_target.parameters()):
@@ -1105,6 +1174,12 @@ if __name__ == "__main__":
               f"margin={BC_Q_FILTER_MARGIN:.3f}")
         print(f"[BC regularization] mode={BC_REG_MODE}")
         print(f"[BC regularization] demo_filter={BC_DEMO_FILTER_MODE}")
+        if BC_DEMO_FILTER_MODE == "soft":
+            print(f"[BC soft] weights: min={BC_SOFT_WEIGHT_MIN:.2f}, "
+                  f"sat={BC_SOFT_WEIGHT_SATURATION:.2f}, "
+                  f"jump={BC_SOFT_WEIGHT_ACTION_JUMP:.2f}, "
+                  f"wrong_dir={BC_SOFT_WEIGHT_WRONG_DIRECTION:.2f}, "
+                  f"no_improve={BC_SOFT_WEIGHT_NO_IMPROVEMENT:.2f}")
         if BC_REG_MODE == "delta":
             print(f"[BC delta] scale={BC_DELTA_SCALE:.2f}, "
                   f"deadzone={BC_DELTA_DEADZONE:.2f}, "
@@ -1148,6 +1223,8 @@ if __name__ == "__main__":
         TAG = "pureRL"
     if USE_BC_REG and BC_DEMO_FILTER_MODE == "filtered" and not RUN_TAG:
         TAG = f"{TAG}Filtered"
+    if USE_BC_REG and BC_DEMO_FILTER_MODE == "soft" and not RUN_TAG:
+        TAG = f"{TAG}SoftFilter"
     if RUN_TAG:
         TAG = RUN_TAG
     ACTOR_OUT = ROOT / "models/actors" / f"best_actor_{TAG}.pth"
