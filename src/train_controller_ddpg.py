@@ -76,6 +76,16 @@ BC_REG_WARM_EPISODES = env_int("BC_REG_WARM_EPISODES", 0)
 BC_DEMO_BATCH_SIZE = env_int("BC_DEMO_BATCH_SIZE", 256)
 BC_QUALITY_MAE_THRESHOLD = env_float("BC_QUALITY_MAE_THRESHOLD", 50.0)
 BC_QUALITY_WINDOW = env_int("BC_QUALITY_WINDOW", 3)
+BC_DEMO_FILTER_MODE = os.environ.get("BC_DEMO_FILTER_MODE", "all").strip().lower()
+BC_FILTER_U_MIN = env_float("BC_FILTER_U_MIN", 5.0)
+BC_FILTER_U_MAX = env_float("BC_FILTER_U_MAX", 95.0)
+BC_FILTER_MAX_DELTA_U = env_float("BC_FILTER_MAX_DELTA_U", 12.0)
+BC_FILTER_MAX_LOAD_DELTA = env_float("BC_FILTER_MAX_LOAD_DELTA", 25.0)
+BC_FILTER_IMPROVE_HORIZON = env_int("BC_FILTER_IMPROVE_HORIZON", 5)
+BC_FILTER_IMPROVE_TOL = env_float("BC_FILTER_IMPROVE_TOL", 0.0)
+BC_FILTER_IMPROVE_MIN_ERROR = env_float("BC_FILTER_IMPROVE_MIN_ERROR", 2.0)
+BC_FILTER_CHECK_DIRECTION = env_bool("BC_FILTER_CHECK_DIRECTION", True)
+BC_FILTER_DEADZONE_U = env_float("BC_FILTER_DEADZONE_U", DEADZONE_FRAC * 100.0)
 BC_REG_MODE = os.environ.get("BC_REG_MODE", "action").strip().lower()
 BC_DELTA_SCALE = env_float("BC_DELTA_SCALE", 10.0)
 BC_DELTA_DEADZONE = env_float("BC_DELTA_DEADZONE", DEADZONE_FRAC * 100.0)
@@ -107,6 +117,10 @@ if PRIOR_OUTPUT_MODE not in {"absolute", "delta"}:
     raise ValueError(
         f"Unsupported PRIOR_OUTPUT_MODE={PRIOR_OUTPUT_MODE!r}; "
         "use 'absolute' or 'delta'.")
+if BC_DEMO_FILTER_MODE not in {"all", "filtered"}:
+    raise ValueError(
+        f"Unsupported BC_DEMO_FILTER_MODE={BC_DEMO_FILTER_MODE!r}; "
+        "use 'all' or 'filtered'.")
 
 # ══════════════════════════════════════════
 # 加载模型
@@ -725,9 +739,56 @@ def build_demo_state(env, shadow_aug, t: int, target_sp=606.0):
     return np.concatenate([base, shadow]).astype(np.float32)
 
 
+def bc_filter_reason(env, t: int, target_sp=606.0):
+    if BC_DEMO_FILTER_MODE == "all":
+        return None
+
+    curr_u = float(env.df[COL_U].iloc[t])
+    next_u = float(env.df[COL_U].iloc[t + 1])
+    delta_u = next_u - curr_u
+
+    if (curr_u < BC_FILTER_U_MIN or curr_u > BC_FILTER_U_MAX or
+            next_u < BC_FILTER_U_MIN or next_u > BC_FILTER_U_MAX):
+        return "saturation"
+    if abs(delta_u) > BC_FILTER_MAX_DELTA_U:
+        return "action_jump"
+
+    curr_load = float(env.df[COL_LOAD].iloc[t])
+    next_load = float(env.df[COL_LOAD].iloc[t + 1])
+    load_step = max(abs(next_load - curr_load),
+                    abs(float(env.df['load_delta'].iloc[t + 1])))
+    if load_step > BC_FILTER_MAX_LOAD_DELTA:
+        return "load_jump"
+
+    signed_error = float(target_sp - env.df[COL_Y].iloc[t])
+    curr_error = abs(signed_error)
+    if (BC_FILTER_CHECK_DIRECTION and curr_error >= BC_FILTER_IMPROVE_MIN_ERROR and
+            abs(delta_u) >= BC_FILTER_DEADZONE_U):
+        expected_sign = np.sign(signed_error) * np.sign(K)
+        if expected_sign != 0 and np.sign(delta_u) != expected_sign:
+            return "wrong_direction"
+
+    h = max(0, BC_FILTER_IMPROVE_HORIZON)
+    if h > 0 and curr_error >= BC_FILTER_IMPROVE_MIN_ERROR and t + h < len(env.df):
+        future_y = env.df[COL_Y].iloc[t + 1:t + h + 1].values
+        best_future_error = float(np.min(np.abs(future_y - target_sp)))
+        if best_future_error > curr_error - BC_FILTER_IMPROVE_TOL:
+            return "no_improvement"
+
+    return None
+
+
 def build_demo_buffer(env, shadow_aug, target_sp=606.0):
     demo = DemoBuffer()
     skipped_quality = 0
+    skipped_filter = {
+        "saturation": 0,
+        "action_jump": 0,
+        "load_jump": 0,
+        "wrong_direction": 0,
+        "no_improvement": 0,
+    }
+    deadzone_snapped = 0
     t_start = env.n_lags
     t_end = len(env.df) - max(CTRL_HORIZON + 1, SHADOW_HORIZON + 1) - 1
     for t in range(t_start, t_end):
@@ -738,11 +799,20 @@ def build_demo_buffer(env, shadow_aug, target_sp=606.0):
             skipped_quality += 1
             continue
 
+        reason = bc_filter_reason(env, t, target_sp=target_sp)
+        if reason is not None:
+            skipped_filter[reason] += 1
+            continue
+
         s = build_demo_state(env, shadow_aug, t, target_sp=target_sp)
         a = []
         prev_u = float(env.df[COL_U].iloc[t])
         for k in range(CTRL_HORIZON):
             target_u = float(env.df[COL_U].iloc[t + k + 1])
+            if (BC_DEMO_FILTER_MODE == "filtered" and
+                    abs(target_u - prev_u) < BC_FILTER_DEADZONE_U):
+                target_u = prev_u
+                deadzone_snapped += 1
             a.append(encode_actor_action(prev_u, target_u, state=s))
             prev_u = action_to_opening(prev_u, a[-1], state=s)
         curr_a = current_actor_reference(float(env.df[COL_U].iloc[t]), state=s)
@@ -750,8 +820,19 @@ def build_demo_buffer(env, shadow_aug, target_sp=606.0):
                   np.array([curr_a], dtype=np.float32))
 
     total = max(t_end - t_start, 1)
+    skipped_filtered_total = sum(skipped_filter.values())
+    print(f"[BC regularization] demo mode: {BC_DEMO_FILTER_MODE}")
     print(f"[BC regularization] demo samples: {len(demo):,}, "
-          f"quality skipped: {skipped_quality:,} ({skipped_quality / total * 100:.1f}%)")
+          f"quality skipped: {skipped_quality:,} ({skipped_quality / total * 100:.1f}%), "
+          f"filtered skipped: {skipped_filtered_total:,} ({skipped_filtered_total / total * 100:.1f}%)")
+    if BC_DEMO_FILTER_MODE == "filtered":
+        detail = ", ".join(f"{k}={v:,}" for k, v in skipped_filter.items())
+        print(f"[BC filtered] {detail}; deadzone snapped={deadzone_snapped:,}")
+        print(f"[BC filtered] u=[{BC_FILTER_U_MIN:.1f}, {BC_FILTER_U_MAX:.1f}], "
+              f"max_delta_u={BC_FILTER_MAX_DELTA_U:.1f}, "
+              f"max_load_delta={BC_FILTER_MAX_LOAD_DELTA:.1f}, "
+              f"improve_h={BC_FILTER_IMPROVE_HORIZON}, "
+              f"min_error={BC_FILTER_IMPROVE_MIN_ERROR:.1f}")
     return demo
 
 
@@ -1023,6 +1104,7 @@ if __name__ == "__main__":
         print(f"[BC regularization] q_filter={BC_REG_Q_FILTER}, "
               f"margin={BC_Q_FILTER_MARGIN:.3f}")
         print(f"[BC regularization] mode={BC_REG_MODE}")
+        print(f"[BC regularization] demo_filter={BC_DEMO_FILTER_MODE}")
         if BC_REG_MODE == "delta":
             print(f"[BC delta] scale={BC_DELTA_SCALE:.2f}, "
                   f"deadzone={BC_DELTA_DEADZONE:.2f}, "
@@ -1064,6 +1146,8 @@ if __name__ == "__main__":
         TAG = "bcReg"
     else:
         TAG = "pureRL"
+    if USE_BC_REG and BC_DEMO_FILTER_MODE == "filtered" and not RUN_TAG:
+        TAG = f"{TAG}Filtered"
     if RUN_TAG:
         TAG = RUN_TAG
     ACTOR_OUT = ROOT / "models/actors" / f"best_actor_{TAG}.pth"
