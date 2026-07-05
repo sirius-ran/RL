@@ -69,6 +69,12 @@ DEADZONE_FRAC  = env_float("DEADZONE_FRAC", 0.05)
 USE_BC_REG = env_bool("USE_BC_REG", True)
 BC_REG_Q_FILTER = env_bool("BC_REG_Q_FILTER", True)
 BC_Q_FILTER_MARGIN = env_float("BC_Q_FILTER_MARGIN", 0.0)
+BC_REG_ADV_WEIGHT = env_bool("BC_REG_ADV_WEIGHT", False)
+BC_ADV_START_EPISODE = env_int("BC_ADV_START_EPISODE", 20)
+BC_ADV_ETA = env_float("BC_ADV_ETA", 1.0)
+BC_ADV_WEIGHT_MIN = env_float("BC_ADV_WEIGHT_MIN", 0.25)
+BC_ADV_WEIGHT_MAX = env_float("BC_ADV_WEIGHT_MAX", 3.0)
+BC_ADV_USE_TARGET = env_bool("BC_ADV_USE_TARGET", True)
 BC_REG_LAMBDA_START = env_float("BC_REG_LAMBDA_START", 1.0)
 BC_REG_LAMBDA_END = env_float("BC_REG_LAMBDA_END", 0.05)
 BC_REG_DECAY_EPISODES = env_int("BC_REG_DECAY_EPISODES", 120)
@@ -917,6 +923,19 @@ def weighted_action_mse(pred, target, weights=None):
     return weighted_tensor_mean(losses, weights)
 
 
+def advantage_bc_weights(critic, states, demo_actions, policy_actions):
+    eta = max(BC_ADV_ETA, 1e-6)
+    with torch.no_grad():
+        q_demo = critic(states, demo_actions)
+        q_policy = critic(states, policy_actions.detach())
+        adv = q_demo - q_policy
+        log_min = float(np.log(max(BC_ADV_WEIGHT_MIN, 1e-6)))
+        log_max = float(np.log(max(BC_ADV_WEIGHT_MAX, BC_ADV_WEIGHT_MIN)))
+        adv_log = torch.clamp(adv / eta, log_min, log_max)
+        weights = torch.exp(adv_log)
+    return weights
+
+
 class DDPGAgent:
     def __init__(self, state_dim, ctrl_horizon=CTRL_HORIZON):
         self.ctrl_horizon  = ctrl_horizon
@@ -944,7 +963,8 @@ class DDPGAgent:
             a += np.random.normal(0, noise, size=a.shape)
         return np.clip(a, -1.0, 1.0)
 
-    def update(self, demo_buffer=None, bc_lambda=0.0, demo_batch_size=BC_DEMO_BATCH_SIZE):
+    def update(self, demo_buffer=None, bc_lambda=0.0,
+               demo_batch_size=BC_DEMO_BATCH_SIZE, use_adv_weight=False):
         if len(self.replay) < self.batch_size:
             return None
         s, a, r, ns, d = self.replay.sample(self.batch_size)
@@ -960,6 +980,7 @@ class DDPGAgent:
         q_loss = -self.critic(S, policy_actions).mean()
         bc_loss = torch.zeros((), device=device)
         bc_active_frac = 0.0
+        bc_adv_weight_mean = 1.0
         if demo_buffer is not None and bc_lambda > 0.0 and len(demo_buffer) > 0:
             ds, da, curr_a, demo_w = demo_buffer.sample(demo_batch_size)
             DS = torch.FloatTensor(ds).to(device)
@@ -967,6 +988,11 @@ class DDPGAgent:
             CA = torch.FloatTensor(curr_a).to(device)
             DW = torch.FloatTensor(demo_w).to(device)
             pred_demo_actions = self.actor(DS)
+            if BC_REG_ADV_WEIGHT and use_adv_weight:
+                adv_critic = self.critic_target if BC_ADV_USE_TARGET else self.critic
+                adv_w = advantage_bc_weights(adv_critic, DS, DA, pred_demo_actions)
+                bc_adv_weight_mean = float(adv_w.mean().item())
+                DW = DW * adv_w
             if BC_REG_Q_FILTER:
                 with torch.no_grad():
                     q_demo = self.critic(DS, DA)
@@ -1054,6 +1080,7 @@ class DDPGAgent:
             'bc_loss': float(bc_loss.item()),
             'bc_lambda': float(bc_lambda),
             'bc_active_frac': bc_active_frac,
+            'bc_adv_weight_mean': bc_adv_weight_mean,
         }
 
 
@@ -1172,6 +1199,10 @@ if __name__ == "__main__":
               f"{BC_REG_LAMBDA_END:.3f} over {BC_REG_DECAY_EPISODES} episodes")
         print(f"[BC regularization] q_filter={BC_REG_Q_FILTER}, "
               f"margin={BC_Q_FILTER_MARGIN:.3f}")
+        print(f"[BC advantage] enabled={BC_REG_ADV_WEIGHT}, "
+              f"start_ep={BC_ADV_START_EPISODE}, eta={BC_ADV_ETA:.3f}, "
+              f"clip=[{BC_ADV_WEIGHT_MIN:.2f}, {BC_ADV_WEIGHT_MAX:.2f}], "
+              f"target_critic={BC_ADV_USE_TARGET}")
         print(f"[BC regularization] mode={BC_REG_MODE}")
         print(f"[BC regularization] demo_filter={BC_DEMO_FILTER_MODE}")
         if BC_DEMO_FILTER_MODE == "soft":
@@ -1225,6 +1256,8 @@ if __name__ == "__main__":
         TAG = f"{TAG}Filtered"
     if USE_BC_REG and BC_DEMO_FILTER_MODE == "soft" and not RUN_TAG:
         TAG = f"{TAG}SoftFilter"
+    if USE_BC_REG and BC_REG_ADV_WEIGHT and not RUN_TAG:
+        TAG = f"{TAG}Adv"
     if RUN_TAG:
         TAG = RUN_TAG
     ACTOR_OUT = ROOT / "models/actors" / f"best_actor_{TAG}.pth"
@@ -1289,9 +1322,11 @@ if __name__ == "__main__":
             r_total = r_env + r_mpc
             agent.replay.push(s, a_raw, r_total, ns, d)
             if not frozen and (t % 2 == 0):
-                update_info = agent.update(demo_buffer=demo_buffer,
-                                           bc_lambda=bc_lambda,
-                                           demo_batch_size=BC_DEMO_BATCH_SIZE)
+                update_info = agent.update(
+                    demo_buffer=demo_buffer,
+                    bc_lambda=bc_lambda,
+                    demo_batch_size=BC_DEMO_BATCH_SIZE,
+                    use_adv_weight=(BC_REG_ADV_WEIGHT and ep >= BC_ADV_START_EPISODE))
                 if update_info is not None:
                     update_logs.append(update_info)
 
