@@ -26,6 +26,7 @@ import matplotlib.gridspec as gridspec
 import warnings
 from pathlib import Path
 import os
+import json
 
 ROOT = Path(__file__).resolve().parents[1]
 SHOW_PLOTS = os.environ.get("SHOW_PLOTS", "0") == "1"
@@ -99,6 +100,7 @@ BC_SOFT_WEIGHT_LOAD_JUMP = env_float("BC_SOFT_WEIGHT_LOAD_JUMP", 0.8)
 BC_SOFT_WEIGHT_WRONG_DIRECTION = env_float("BC_SOFT_WEIGHT_WRONG_DIRECTION", 0.35)
 BC_SOFT_WEIGHT_NO_IMPROVEMENT = env_float("BC_SOFT_WEIGHT_NO_IMPROVEMENT", 0.7)
 BC_SOFT_SNAP_DEADZONE = env_bool("BC_SOFT_SNAP_DEADZONE", False)
+BC_REG_TARGET = os.environ.get("BC_REG_TARGET", "demo").strip().lower()
 BC_REG_MODE = os.environ.get("BC_REG_MODE", "action").strip().lower()
 BC_DELTA_SCALE = env_float("BC_DELTA_SCALE", 10.0)
 BC_DELTA_DEADZONE = env_float("BC_DELTA_DEADZONE", DEADZONE_FRAC * 100.0)
@@ -128,6 +130,7 @@ VAL_SCORE_SAT_WEIGHT = env_float("VAL_SCORE_SAT_WEIGHT", 0.01)
 VAL_SCORE_FLIP_WEIGHT = env_float("VAL_SCORE_FLIP_WEIGHT", 0.005)
 MAX_EPISODES = env_int("MAX_EPISODES", 200)
 WARMUP_STEPS = env_int("WARMUP_STEPS", 5000)
+LGB_PRED_N_JOBS = env_int("LGB_PRED_N_JOBS", 0)
 
 if ACTION_MODE not in {"absolute", "residual", "bc_prior_residual"}:
     raise ValueError(
@@ -141,6 +144,14 @@ if BC_DEMO_FILTER_MODE not in {"all", "filtered", "soft"}:
     raise ValueError(
         f"Unsupported BC_DEMO_FILTER_MODE={BC_DEMO_FILTER_MODE!r}; "
         "use 'all', 'filtered', or 'soft'.")
+if BC_REG_TARGET not in {"demo", "zero_residual"}:
+    raise ValueError(
+        f"Unsupported BC_REG_TARGET={BC_REG_TARGET!r}; "
+        "use 'demo' or 'zero_residual'.")
+if BC_REG_TARGET == "zero_residual" and ACTION_MODE != "bc_prior_residual":
+    raise ValueError(
+        "BC_REG_TARGET='zero_residual' requires "
+        "ACTION_MODE='bc_prior_residual'.")
 if VAL_SELECTION_OBJECTIVE not in {"mae", "quality_score"}:
     raise ValueError(
         f"Unsupported VAL_SELECTION_OBJECTIVE={VAL_SELECTION_OBJECTIVE!r}; "
@@ -162,6 +173,12 @@ try:
 except FileNotFoundError:
     shadow_model = None
     print("⚠ 未找到 boiler_env_model.pkl")
+
+if LGB_PRED_N_JOBS > 0:
+    model_d.set_params(n_jobs=LGB_PRED_N_JOBS)
+    if shadow_model is not None:
+        shadow_model.set_params(n_jobs=LGB_PRED_N_JOBS)
+    print(f"[LightGBM] prediction n_jobs={LGB_PRED_N_JOBS}")
 
 K, u_ss = params['K'], params['u_ss']
 features_d, N_LAGS = params['features_d'], params['N_LAGS']
@@ -650,7 +667,9 @@ class BoilerGymEnvPhysics:
         new_ctrl_state = [next_x1, next_x2, next_x3]
 
         y_dist_next = float(self.model_d.predict(self._build_input_d())[0])
-        pred_y = y_dist_next + next_x3 + np.random.normal(0, self.noise_std)
+        noise = (np.random.normal(0, self.noise_std)
+                 if self.noise_std > 0.0 else 0.0)
+        pred_y = y_dist_next + next_x3 + noise
         y_shadow = pred_y
         if self.shadow_predictor is not None:
             h_y = list(self.y_hist)[-self.n_lags_shadow:][::-1]
@@ -992,7 +1011,11 @@ class DDPGAgent:
         bc_loss = torch.zeros((), device=device)
         bc_active_frac = 0.0
         bc_adv_weight_mean = 1.0
-        if demo_buffer is not None and bc_lambda > 0.0 and len(demo_buffer) > 0:
+        if BC_REG_TARGET == "zero_residual" and bc_lambda > 0.0:
+            bc_loss = weighted_action_mse(
+                policy_actions, torch.zeros_like(policy_actions))
+            bc_active_frac = 1.0
+        elif demo_buffer is not None and bc_lambda > 0.0 and len(demo_buffer) > 0:
             ds, da, curr_a, demo_w = demo_buffer.sample(demo_batch_size)
             DS = torch.FloatTensor(ds).to(device)
             DA = torch.FloatTensor(da).to(device)
@@ -1245,12 +1268,17 @@ if __name__ == "__main__":
             print(f"[BC prior residual] loaded prior actor: {BC_PRIOR_ACTOR_PATH}")
         except Exception as e:
             raise RuntimeError(f"Failed to load BC prior actor from {BC_PRIOR_ACTOR_PATH}: {e}")
-    demo_buffer = build_demo_buffer(env, shadow_aug, target_sp=env.target_sp) if USE_BC_REG else None
+    demo_buffer = (build_demo_buffer(env, shadow_aug, target_sp=env.target_sp)
+                   if USE_BC_REG and BC_REG_TARGET == "demo" else None)
     if USE_BC_REG:
         print(f"[BC regularization] lambda: {BC_REG_LAMBDA_START:.3f} -> "
               f"{BC_REG_LAMBDA_END:.3f} over {BC_REG_DECAY_EPISODES} episodes")
         print(f"[BC regularization] q_filter={BC_REG_Q_FILTER}, "
               f"margin={BC_Q_FILTER_MARGIN:.3f}")
+        print(f"[BC regularization] target={BC_REG_TARGET}")
+        if BC_REG_TARGET == "zero_residual":
+            print("[BC regularization] zero residual is applied on replay states; "
+                  "demo filter and Q filter are not used for this term")
         print(f"[BC advantage] enabled={BC_REG_ADV_WEIGHT}, "
               f"start_ep={BC_ADV_START_EPISODE}, eta={BC_ADV_ETA:.3f}, "
               f"clip=[{BC_ADV_WEIGHT_MIN:.2f}, {BC_ADV_WEIGHT_MAX:.2f}], "
@@ -1289,7 +1317,10 @@ if __name__ == "__main__":
             print(f"✗ BC 权重加载失败，回退随机初始化: {e}")
             USE_BC = False
     else:
-        print("▶ [纯RL对照] Actor 随机初始化")
+        if ACTION_MODE == "bc_prior_residual":
+            print("▶ [基线残差] Actor 零初始化，初始策略等于冻结基线")
+        else:
+            print("▶ [纯RL对照] Actor 随机初始化")
     # 产物标签：两组实验产物自动分开，避免互相覆盖
     TAG = "withBC" if USE_BC else "pureRL"
     if USE_BC and USE_BC_REG and BC_REG_Q_FILTER:
@@ -1318,6 +1349,36 @@ if __name__ == "__main__":
     TRAIN_REWARD_ACTOR_OUT = ROOT / "models/actors" / f"best_actor_{TAG}_trainReward.pth"
     TRAIN_REWARD_PKL_OUT = ROOT / "results/checkpoints" / f"multistep_best_{TAG}_trainReward.pkl"
     VAL_HISTORY_OUT = ROOT / "results/evaluation" / f"validation_history_{TAG}.csv"
+    RUN_CONFIG_OUT = ROOT / "results/evaluation" / f"run_config_{TAG}.json"
+    run_config = {
+        "tag": TAG,
+        "seed": SEED,
+        "train_data_path": str(TRAIN_DATA_PATH),
+        "val_data_path": str(VAL_DATA_PATH) if VAL_DATA_PATH else None,
+        "use_val_selection": bool(use_val_selection),
+        "val_selection_objective": VAL_SELECTION_OBJECTIVE,
+        "max_episodes": MAX_EPISODES,
+        "warmup_steps": WARMUP_STEPS,
+        "lgb_pred_n_jobs": LGB_PRED_N_JOBS,
+        "action_mode": ACTION_MODE,
+        "residual_max_delta": RESIDUAL_MAX_DELTA,
+        "prior_output_mode": PRIOR_OUTPUT_MODE,
+        "bc_prior_actor_path": str(BC_PRIOR_ACTOR_PATH),
+        "use_bc_reg": USE_BC_REG,
+        "bc_reg_target": BC_REG_TARGET,
+        "bc_reg_lambda_start": BC_REG_LAMBDA_START,
+        "bc_reg_lambda_end": BC_REG_LAMBDA_END,
+        "bc_reg_decay_episodes": BC_REG_DECAY_EPISODES,
+        "bc_reg_warm_episodes": BC_REG_WARM_EPISODES,
+        "bc_reg_q_filter": BC_REG_Q_FILTER,
+        "bc_demo_filter_mode": BC_DEMO_FILTER_MODE,
+        "deadzone_frac": DEADZONE_FRAC,
+        "train_norm_stats": {k: float(v) for k, v in env.stats.items()},
+    }
+    RUN_CONFIG_OUT.parent.mkdir(parents=True, exist_ok=True)
+    with RUN_CONFIG_OUT.open("w", encoding="utf-8") as f:
+        json.dump(run_config, f, ensure_ascii=False, indent=2)
+    print(f"[Run config] saved: {RUN_CONFIG_OUT}")
     if use_val_selection:
         print(f"[Validation] actor selected by {VAL_SELECTION_OBJECTIVE} -> {ACTOR_OUT}")
         if VAL_SELECTION_OBJECTIVE == "quality_score":
